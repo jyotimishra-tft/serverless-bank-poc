@@ -1,0 +1,608 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: >
+  poc-foundation - Full stack for serverless POC:
+  Cognito User Pool + App Client, RDS Postgres, and the API/Lambda layer.
+
+Parameters:
+  DbName:
+    Type: String
+    Default: pocdb
+  DbMasterUsername:
+    Type: String
+    Default: postgres
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+    Description: VPC to launch the DB into (use your default VPC for a quick POC)
+  SubnetIds:
+    Type: List<AWS::EC2::Subnet::Id>
+    Description: At least 2 subnets in different AZs
+  FromEmail:
+    Type: String
+    Description: Verified SES sender email address
+
+Globals:
+  Function:
+    Timeout: 60
+    Runtime: nodejs20.x
+    Environment:
+      Variables:
+        NODE_OPTIONS: --enable-source-maps
+
+Resources:
+
+  ############################
+  # Cognito
+  ############################
+
+  UserPool:
+    Type: AWS::Cognito::UserPool
+    Properties:
+      UserPoolName: poc-user-pool
+      AutoVerifiedAttributes:
+        - email
+      UsernameAttributes:
+        - email
+      LambdaConfig:
+        PreSignUp: !GetAtt PreSignUpFunction.Arn
+        PostConfirmation: !GetAtt PostConfirmationFunction.Arn
+      Policies:
+        PasswordPolicy:
+          MinimumLength: 8
+          RequireLowercase: true
+          RequireNumbers: true
+          RequireSymbols: false
+          RequireUppercase: true
+
+  UserPoolClient:
+    Type: AWS::Cognito::UserPoolClient
+    Properties:
+      ClientName: poc-app-client
+      UserPoolId: !Ref UserPool
+      GenerateSecret: false   # false = usable directly from browser/mobile JS
+      ExplicitAuthFlows:
+        - ALLOW_USER_PASSWORD_AUTH
+        - ALLOW_REFRESH_TOKEN_AUTH
+        - ALLOW_USER_SRP_AUTH
+
+  ############################
+  # Networking for the DB (and Lambda)
+  ############################
+
+  DbSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Allow Postgres access to RDS from anything sharing this SG
+      VpcId: !Ref VpcId
+
+  DbSecurityGroupSelfIngress:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref DbSecurityGroup
+      IpProtocol: tcp
+      FromPort: 5432
+      ToPort: 5432
+      SourceSecurityGroupId: !Ref DbSecurityGroup
+      # Self-referencing rule: anything using DbSecurityGroup (including the
+      # Lambda below) can reach anything else using DbSecurityGroup (the DB).
+      # Fixes the earlier CIDR-guessing approach, which assumed a 10.x VPC
+      # range that default VPCs (usually 172.31.x) don't actually use.
+
+  DbSubnetGroup:
+    Type: AWS::RDS::DBSubnetGroup
+    Properties:
+      DBSubnetGroupDescription: Subnets for RDS instance and Lambda
+      SubnetIds: !Ref SubnetIds
+
+  ############################
+  # RDS Postgres - single cheap instance (Free Tier eligible)
+  ############################
+
+  DbSecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: poc-db-master-secret
+      GenerateSecretString:
+        SecretStringTemplate: !Sub '{"username":"${DbMasterUsername}"}'
+        GenerateStringKey: password
+        PasswordLength: 20
+        ExcludePunctuation: true
+
+  AppUserSecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: poc-db-app-user-secret
+      GenerateSecretString:
+        SecretStringTemplate: '{"username":"app_user"}'
+        GenerateStringKey: password
+        PasswordLength: 20
+        ExcludePunctuation: true
+      # After deploy: fetch this secret's password and run
+      # ALTER USER app_user WITH PASSWORD '<that password>';
+      # so the DB and this secret actually match.
+
+  DbInstance:
+    Type: AWS::RDS::DBInstance
+    Properties:
+      Engine: postgres
+      EngineVersion: '15.19'
+      DBInstanceIdentifier: poc-db
+      DBInstanceClass: db.t4g.micro       # Free Tier eligible (first 12 months, new accounts)
+      AllocatedStorage: '20'              # Free Tier max
+      StorageType: gp2
+      DBName: !Ref DbName
+      MasterUsername: !Ref DbMasterUsername
+      MasterUserPassword: !Sub '{{resolve:secretsmanager:${DbSecret}::password}}'
+      DBSubnetGroupName: !Ref DbSubnetGroup
+      VPCSecurityGroups:
+        - !Ref DbSecurityGroup
+      EnableIAMDatabaseAuthentication: true
+      PubliclyAccessible: false
+      MultiAZ: false
+      BackupRetentionPeriod: 0
+      DeletionProtection: false
+
+  ############################
+  # API Gateway (HTTP API) + Lambda
+  ############################
+
+  HttpApi:
+    Type: AWS::Serverless::HttpApi
+    Properties:
+      StageName: dev
+      CorsConfiguration:
+        AllowMethods:
+          - GET
+          - POST
+          - PUT
+          - OPTIONS
+        AllowHeaders:
+          - Content-Type
+          - Authorization
+        AllowOrigins:
+          - "*"   # tighten to your actual frontend origin before this goes anywhere real
+      Auth:
+        Authorizers:
+          CognitoAuthorizer:
+            JwtConfiguration:
+              issuer: !Sub "https://cognito-idp.${AWS::Region}.amazonaws.com/${UserPool}"
+              audience:
+                - !Ref UserPoolClient
+            IdentitySource: "$request.header.Authorization"
+        DefaultAuthorizer: CognitoAuthorizer
+        # Every route requires a valid Cognito JWT unless it explicitly
+        # overrides with Auth: Authorizer: NONE (see HealthFunction below).
+
+  HealthFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      Handler: src/handlers/health.handler
+      CodeUri: ./
+      Events:
+        Health:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref HttpApi
+            Path: /health
+            Method: GET
+            Auth:
+              Authorizer: NONE
+    Metadata:
+      BuildMethod: esbuild
+      BuildProperties:
+        EntryPoints:
+          - src/handlers/health.ts
+
+  LoginFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      Handler: src/handlers/login.handler
+      CodeUri: ./
+      Environment:
+        Variables:
+          USER_POOL_CLIENT_ID: !Ref UserPoolClient
+      Events:
+        Login:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref HttpApi
+            Path: /login
+            Method: POST
+            Auth:
+              Authorizer: NONE
+    Metadata:
+      BuildMethod: esbuild
+      BuildProperties:
+        EntryPoints:
+          - src/handlers/login.ts
+
+  SignupFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      Handler: src/handlers/signup.handler
+      CodeUri: ./
+      Environment:
+        Variables:
+          USER_POOL_CLIENT_ID: !Ref UserPoolClient
+      Events:
+        Signup:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref HttpApi
+            Path: /signup
+            Method: POST
+            Auth:
+              Authorizer: NONE
+    Metadata:
+      BuildMethod: esbuild
+      BuildProperties:
+        EntryPoints:
+          - src/handlers/signup.ts
+
+  PrismaLayer:
+    Type: AWS::Serverless::LayerVersion
+    Properties:
+      LayerName: poc-prisma-layer
+      Description: Prisma client + native query engine binary, shared across functions
+      ContentUri: layers/prisma-layer/
+      CompatibleRuntimes:
+        - nodejs20.x
+      RetentionPolicy: Delete
+    # No BuildMethod - the folder is pre-built by build-prisma-layer.ps1,
+    # sam build just zips it as-is.
+
+  PreSignUpFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      Handler: src/handlers/preSignUp.handler
+      CodeUri: ./
+      Layers: &PrismaLayers
+        - !Ref PrismaLayer
+      VpcConfig: &PrismaVpcConfig
+        SubnetIds: !Ref SubnetIds
+        SecurityGroupIds:
+          - !Ref DbSecurityGroup
+      Environment: &PrismaEnvironment
+        Variables:
+          DB_HOST: !GetAtt DbInstance.Endpoint.Address
+          DB_PORT: !GetAtt DbInstance.Endpoint.Port
+          DB_NAME: !Ref DbName
+          DB_SECRET_ARN: !Ref DbSecret
+      Policies: &PrismaPolicies
+        - Statement:
+            - Effect: Allow
+              Action: secretsmanager:GetSecretValue
+              Resource: !Ref DbSecret
+    Metadata:
+      BuildMethod: esbuild
+      BuildProperties:
+        EntryPoints:
+          - src/handlers/preSignUp.ts
+        External: &PrismaExternal
+          - "@prisma/client"
+
+  PreSignUpInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref PreSignUpFunction
+      Principal: cognito-idp.amazonaws.com
+      SourceArn: !GetAtt UserPool.Arn
+
+  PostConfirmationFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      Handler: src/handlers/postConfirmation.handler
+      CodeUri: ./
+      Layers: *PrismaLayers
+      VpcConfig: *PrismaVpcConfig
+      Environment: *PrismaEnvironment
+      Policies: *PrismaPolicies
+    Metadata:
+      BuildMethod: esbuild
+      BuildProperties:
+        EntryPoints:
+          - src/handlers/postConfirmation.ts
+        External: *PrismaExternal
+
+  PostConfirmationInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref PostConfirmationFunction
+      Principal: cognito-idp.amazonaws.com
+      SourceArn: !GetAtt UserPool.Arn
+
+  WhoAmIFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      Handler: src/handlers/whoami.handler
+      CodeUri: ./
+      Layers: *PrismaLayers
+      VpcConfig: *PrismaVpcConfig
+      Environment: *PrismaEnvironment
+      Policies: *PrismaPolicies
+      Events:
+        WhoAmI:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref HttpApi
+            Path: /whoami
+            Method: GET
+    Metadata:
+      BuildMethod: esbuild
+      BuildProperties:
+        EntryPoints:
+          - src/handlers/whoami.ts
+        External: *PrismaExternal
+
+  CustomerCasesProgressSummaryFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      Handler: src/handlers/customerCasesProgressSummary.handler
+      CodeUri: ./
+      Layers: *PrismaLayers
+      VpcConfig: *PrismaVpcConfig
+      Environment: *PrismaEnvironment
+      Policies: *PrismaPolicies
+      Events:
+        CustomerCasesProgressSummary:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref HttpApi
+            Path: /customer/progressSummary
+            Method: GET
+    Metadata:
+      BuildMethod: esbuild
+      BuildProperties:
+        EntryPoints:
+          - src/handlers/customerCasesProgressSummary.ts
+        External: *PrismaExternal
+
+  AgentCasesProgressSummaryFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      Handler: src/handlers/agentCasesProgressSummary.handler
+      CodeUri: ./
+      Layers: *PrismaLayers
+      VpcConfig: *PrismaVpcConfig
+      Environment: *PrismaEnvironment
+      Policies: *PrismaPolicies
+      Events:
+        AgentCasesProgressSummary:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref HttpApi
+            Path: /agent/progressSummary
+            Method: GET
+    Metadata:
+      BuildMethod: esbuild
+      BuildProperties:
+        EntryPoints:
+          - src/handlers/agentCasesProgressSummary.ts
+        External: *PrismaExternal
+
+  CustomerCaseDetailFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      Handler: src/handlers/customerCaseDetail.handler
+      CodeUri: ./
+      Layers: *PrismaLayers
+      VpcConfig: *PrismaVpcConfig
+      Environment: *PrismaEnvironment
+      Policies: *PrismaPolicies
+      Events:
+        CustomerCaseDetail:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref HttpApi
+            Path: /customer/cases/{caseId}
+            Method: GET
+
+    Metadata:
+      BuildMethod: esbuild
+      BuildProperties:
+        EntryPoints:
+          - src/handlers/customerCaseDetail.ts
+        External: *PrismaExternal
+
+  CustomerSubmitTaskFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      Handler: src/handlers/customerSubmitTask.handler
+      CodeUri: ./
+      Layers: *PrismaLayers
+      VpcConfig: *PrismaVpcConfig
+      Environment: *PrismaEnvironment
+      Policies: *PrismaPolicies
+      Events:
+        CustomerSubmitTask:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref HttpApi
+            Path: /customer/cases/{caseId}/tasks/{taskId}/submit
+            Method: POST
+
+    Metadata:
+      BuildMethod: esbuild
+      BuildProperties:
+        EntryPoints:
+          - src/handlers/customerSubmitTask.ts
+        External: *PrismaExternal
+
+  AgentCaseDetailFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      Handler: src/handlers/agentCaseDetails.handler
+      CodeUri: ./
+      Layers: *PrismaLayers
+      VpcConfig: *PrismaVpcConfig
+      Environment: *PrismaEnvironment
+      Policies: *PrismaPolicies
+      Events:
+        AgentCaseDetail:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref HttpApi
+            Path: /agent/cases/{caseId}
+            Method: GET
+    Metadata:
+      BuildMethod: esbuild
+      BuildProperties:
+        EntryPoints:
+          - src/handlers/agentCaseDetails.ts
+        External: *PrismaExternal
+
+  AgentSubmitTaskFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      Handler: src/handlers/agentSubmitTask.handler
+      CodeUri: ./
+      Layers: *PrismaLayers
+      VpcConfig: *PrismaVpcConfig
+      Environment: *PrismaEnvironment
+      Policies: *PrismaPolicies
+      Events:
+        AgentSubmitTask:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref HttpApi
+            Path: /agent/cases/{caseId}/tasks/{taskId}/submit
+            Method: POST
+    Metadata:
+      BuildMethod: esbuild
+      BuildProperties:
+        EntryPoints:
+          - src/handlers/agentSubmitTask.ts
+        External: *PrismaExternal
+
+  NotifyFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      Handler: src/handlers/notifyHandler.handler
+      CodeUri: ./
+      Timeout: 60
+
+      Layers: *PrismaLayers
+
+      VpcConfig: *PrismaVpcConfig
+
+      Environment:
+        Variables:
+          DB_HOST: !GetAtt DbInstance.Endpoint.Address
+          DB_PORT: !GetAtt DbInstance.Endpoint.Port
+          DB_NAME: !Ref DbName
+          DB_SECRET_ARN: !Ref DbSecret
+          FROM_EMAIL: !Ref FromEmail
+
+      Policies:
+        - Statement:
+            - Effect: Allow
+              Action:
+                - secretsmanager:GetSecretValue
+              Resource: !Ref DbSecret
+
+            - Effect: Allow
+              Action:
+                - ses:SendEmail
+                - ses:SendRawEmail
+              Resource: "*"
+
+      Events:
+        HourlyNotificationSweep:
+          Type: Schedule
+          Properties:
+            Schedule: rate(1 hour)
+            Enabled: true
+
+    Metadata:
+      BuildMethod: esbuild
+      BuildProperties:
+        EntryPoints:
+          - src/handlers/notifyHandler.ts
+        External: *PrismaExternal
+
+  ############################
+  # CSV import (S3-triggered)
+  ############################
+
+  CsvImportBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub poc-case-progress-imports-${AWS::AccountId}
+      # Upload all CSVs for a batch into the same folder, e.g.:
+      #   imports/batch-2026-09-01/organisations.csv
+      #   imports/batch-2026-09-01/customers.csv
+      #   ...
+      # then upload a marker file named exactly "_batch.complete" into that
+      # SAME folder last. The marker - not the CSVs - is what triggers
+      # processing (see CsvImportFunction's Filter below). Upload order of
+      # the CSVs themselves doesn't matter; only the marker's timing does.
+
+  CsvImportFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      Handler: src/handlers/csvImportHandler.handler
+      CodeUri: ./
+      Timeout: 300
+      Layers: *PrismaLayers
+      VpcConfig: *PrismaVpcConfig
+      Environment: *PrismaEnvironment
+      Policies:
+        - Statement:
+            - Effect: Allow
+              Action: s3:GetObject
+              Resource: !Sub "arn:aws:s3:::poc-case-progress-imports-${AWS::AccountId}/*"
+            - Effect: Allow
+              Action: s3:ListBucket
+              Resource: !Sub "arn:aws:s3:::poc-case-progress-imports-${AWS::AccountId}"
+            - Effect: Allow
+              Action: secretsmanager:GetSecretValue
+              Resource: !Ref DbSecret
+      Events:
+        BatchComplete:
+          Type: S3
+          Properties:
+            Bucket: !Ref CsvImportBucket
+            Events: s3:ObjectCreated:*
+            Filter:
+              S3Key:
+                Rules:
+                  - Name: prefix
+                    Value: imports/
+                  - Name: suffix
+                    Value: _batch.complete
+    Metadata:
+      BuildMethod: esbuild
+      BuildProperties:
+        EntryPoints:
+          - src/handlers/csvImportHandler.ts
+        External: *PrismaExternal
+
+Outputs:
+  UserPoolId:
+    Value: !Ref UserPool
+  UserPoolClientId:
+    Value: !Ref UserPoolClient
+  DbEndpoint:
+    Description: Use this in app connection strings
+    Value: !GetAtt DbInstance.Endpoint.Address
+  DbPort:
+    Value: !GetAtt DbInstance.Endpoint.Port
+  DbName:
+    Value: !Ref DbName
+  DbResourceId:
+    Description: Needed for the rds-db:connect IAM policy ARN
+    Value: !GetAtt DbInstance.DbiResourceId
+  DbMasterSecretArn:
+    Description: One-time use - to log in as master and GRANT rds_iam to your app user
+    Value: !Ref DbSecret
+  AppUserSecretArn:
+    Description: Fetch this, then ALTER USER app_user WITH PASSWORD to match it
+    Value: !Ref AppUserSecret
+  ApiUrl:
+    Description: HTTP API endpoint
+    Value: !Sub "https://${HttpApi}.execute-api.${AWS::Region}.amazonaws.com/dev"
+  CsvImportBucketName:
+    Description: Upload CSVs here under imports/ prefix
+    Value: !Ref CsvImportBucket

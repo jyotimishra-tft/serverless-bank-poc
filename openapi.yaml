@@ -1,0 +1,101 @@
+openapi: 3.0.3
+info:
+  title: Case Progress POC API
+  version: 0.1.0
+paths:
+  /health:
+    get:
+      summary: Health check
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status:
+                    type: string
+  /customer/cases/progress-summary:
+    get:
+      summary: Customer progress summary
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: Customer case summary
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  cases:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        caseId:
+                          type: string
+                        referenceNumber:
+                          type: string
+                        agreementReference:
+                          type: string
+                        overallStatus:
+                          type: string
+                        currentStepName:
+                          type: string
+                        pendingTaskCount:
+                          type: integer
+                        nextDueDate:
+                          type: string
+                          nullable: true
+                        lastUpdatedAt:
+                          type: string
+  /customer/cases/{caseId}:
+    get:
+      summary: Get case detail
+      parameters:
+        - in: path
+          name: caseId
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Case detail
+          content:
+            application/json:
+              schema:
+                type: object
+  /customer/cases/{caseId}/tasks/{taskId}/submit:
+    post:
+      summary: Submit a task result
+      parameters:
+        - in: path
+          name: caseId
+          required: true
+          schema:
+            type: string
+        - in: path
+          name: taskId
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                result:
+                  type: object
+      responses:
+        '200':
+          description: Task submitted
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT

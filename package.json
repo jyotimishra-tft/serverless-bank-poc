@@ -1,0 +1,44 @@
+{
+  "name": "aws-serverless-case-progress-poc",
+  "version": "0.1.0",
+  "private": true,
+  "main": "dist/index.js",
+  "scripts": {
+    "build": "tsc",
+    "dev": "ts-node-dev --respawn --transpile-only src/handlers/health.ts",
+    "lint": "eslint . --ext .ts",
+    "test": "jest",
+    "prepare": "prisma generate",
+    "start": "node dist/index.js"
+  },
+  "dependencies": {
+    "@aws-sdk/client-cognito-identity-provider": "^3.1121.0",
+    "@aws-sdk/client-s3": "^3.1124.0",
+    "@aws-sdk/client-secrets-manager": "^3.1121.0",
+    "@aws-sdk/client-ses": "^3.1108.0",
+    "@prisma/client": "^5.22.0",
+    "aws-lambda": "^1.0.7",
+    "uuid": "^9.0.1",
+    "zod": "^3.25.76"
+  },
+  "devDependencies": {
+    "@types/jest": "^29.5.14",
+    "@types/node": "^20.0.0",
+    "esbuild": "^0.28.2",
+    "eslint": "^8.57.1",
+    "jest": "^29.7.0",
+    "prisma": "^5.22.0",
+    "ts-jest": "^29.4.12",
+    "ts-node": "^10.9.2",
+    "ts-node-dev": "^2.0.0",
+    "typescript": "^5.9.3"
+  },
+  "description": "",
+  "directories": {
+    "test": "tests"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "commonjs"
+}

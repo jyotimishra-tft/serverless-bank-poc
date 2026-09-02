@@ -1,0 +1,329 @@
+// ============================================================================
+// Case Progress POC — Prisma schema (revision 2)
+// Aligned to brd-customer-case-progress-summary.md, not the larger reference
+// POC's maker-checker structure. Auth = Cognito. DB access = Prisma +
+// Secrets Manager (see README notes in the accompanying message).
+// ============================================================================
+
+generator client {
+  provider      = "prisma-client-js"
+  binaryTargets = ["native", "rhel-openssl-3.0.x"] // nodejs20.x Lambda runtime (Amazon Linux 2023)
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ---------------------------------------------------------------------------
+// Enums
+// ---------------------------------------------------------------------------
+
+enum TaskStatus {
+  pending
+  submitted
+}
+
+enum SubmittedByType {
+  customer
+  agent
+}
+
+enum ActorType {
+  customer
+  agent
+  system
+}
+
+enum ExchangeDirection {
+  import
+  export
+}
+
+enum ExchangeStatus {
+  running
+  completed
+  completed_with_errors
+}
+
+enum InviteStatus {
+  pending
+  redeemed
+  expired
+}
+
+// ---------------------------------------------------------------------------
+// Organisation — bank/upstream-sourced. inviteCode is the static per-org code
+// agents use at Cognito sign-up (validated in a PreSignUp Lambda trigger).
+// ---------------------------------------------------------------------------
+
+model Organisation {
+  id         String   @id @default(uuid()) @db.Uuid
+  externalId String?  @unique @map("external_id")
+  name       String
+  inviteCode String   @unique @map("invite_code")
+  isBlocked  Boolean  @default(false) @map("is_blocked")
+  createdAt  DateTime @default(now()) @map("created_at")
+  updatedAt  DateTime @updatedAt @map("updated_at")
+
+  agents          Agent[]
+  representations CaseRepresentation[]
+
+  @@map("organisation")
+}
+
+// ---------------------------------------------------------------------------
+// Agent — NOT part of the bank CSV import (FR-18's order excludes it; agents
+// self-register via Cognito + org invite code). cognitoSub links to the
+// Cognito User Pool identity; there's no local password.
+// ---------------------------------------------------------------------------
+
+model Agent {
+  id             String   @id @default(uuid()) @db.Uuid
+  cognitoSub     String   @unique @map("cognito_sub")
+  organisationId String   @db.Uuid @map("organisation_id")
+  email          String
+  name           String?
+  isActive       Boolean  @default(true) @map("is_active")
+  createdAt      DateTime @default(now()) @map("created_at")
+  updatedAt      DateTime @updatedAt @map("updated_at")
+
+  organisation Organisation @relation(fields: [organisationId], references: [id])
+
+  @@unique([organisationId, email])
+  @@index([organisationId])
+  @@map("agent")
+}
+
+// ---------------------------------------------------------------------------
+// Customer — IS part of the bank CSV import (needs externalId + updatedAt
+// for the upsert-skip-if-older rule). cognitoSub links a self-registered
+// portal login to the bank-sourced customer row once the email matches.
+// ---------------------------------------------------------------------------
+
+model Customer {
+  id            String   @id @default(uuid()) @db.Uuid
+  externalId    String?  @unique @map("external_id")
+  cognitoSub    String?  @unique @map("cognito_sub")
+  email         String   @unique
+  firstName     String   @map("first_name")
+  lastName      String?  @map("last_name")
+  mobilePhone   String?  @map("mobile_phone")
+  commPrefEmail Boolean  @default(true) @map("comm_pref_email")
+  createdAt     DateTime @default(now()) @map("created_at")
+  updatedAt     DateTime @updatedAt @map("updated_at")
+
+  addresses  CustomerAddress[]
+  agreements Agreement[]
+  claimCases ClaimCase[]
+  invites    Invite[]
+
+  @@map("customer")
+}
+
+model CustomerAddress {
+  id         String   @id @default(uuid()) @db.Uuid
+  externalId String?  @unique @map("external_id")
+  customerId String   @db.Uuid @map("customer_id")
+  line1      String
+  line2      String?
+  city       String
+  postcode   String
+  country    String   @default("GB")
+  createdAt  DateTime @default(now()) @map("created_at")
+  updatedAt  DateTime @updatedAt @map("updated_at")
+
+  customer Customer @relation(fields: [customerId], references: [id])
+
+  @@index([customerId])
+  @@map("customer_address")
+}
+
+// NB: per the BRD's ERD, an agreement belongs to a customer only — not
+// directly to an organisation. Organisation access is via CaseRepresentation
+// on the case, not the agreement.
+model Agreement {
+  id         String   @id @default(uuid()) @db.Uuid
+  externalId String?  @unique @map("external_id")
+  reference  String   @unique
+  customerId String   @db.Uuid @map("customer_id")
+  createdAt  DateTime @default(now()) @map("created_at")
+  updatedAt  DateTime @updatedAt @map("updated_at")
+
+  customer   Customer    @relation(fields: [customerId], references: [id])
+  claimCases ClaimCase[]
+
+  @@index([customerId])
+  @@map("agreement")
+}
+
+model ClaimCase {
+  id              String   @id @default(uuid()) @db.Uuid
+  externalId      String?  @unique @map("external_id")
+  referenceNumber String   @unique @map("reference_number")
+  agreementId     String   @db.Uuid @map("agreement_id")
+  customerId      String   @db.Uuid @map("customer_id")
+  createdAt       DateTime @default(now()) @map("created_at")
+  updatedAt       DateTime @updatedAt @map("updated_at")
+
+  // overallStatus and currentStepName are deliberately NOT columns here —
+  // derive both at query time (statusService.ts already does overallStatus;
+  // extend it for currentStepName) so they can never go stale relative to
+  // the underlying tasks/steps. See the note in the accompanying message.
+
+  agreement       Agreement            @relation(fields: [agreementId], references: [id])
+  customer        Customer             @relation(fields: [customerId], references: [id])
+  workflowSteps   WorkflowStep[]
+  representations CaseRepresentation[]
+  invites         Invite[]
+  notification    CaseNotification?
+
+  @@index([customerId])
+  @@index([agreementId])
+  @@map("claim_case")
+}
+
+// Makes agent org-scoping possible (FR-6, FR-7) — did not exist before.
+model CaseRepresentation {
+  id             String   @id @default(uuid()) @db.Uuid
+  externalId     String?  @unique @map("external_id")
+  claimCaseId    String   @db.Uuid @map("claim_case_id")
+  organisationId String   @db.Uuid @map("organisation_id")
+  isActive       Boolean  @default(true) @map("is_active")
+  createdAt      DateTime @default(now()) @map("created_at")
+  updatedAt      DateTime @updatedAt @map("updated_at")
+
+  claimCase    ClaimCase    @relation(fields: [claimCaseId], references: [id])
+  organisation Organisation @relation(fields: [organisationId], references: [id])
+
+  @@unique([claimCaseId, organisationId])
+  @@index([organisationId])
+  @@map("case_representation")
+}
+
+model WorkflowStep {
+  id          String    @id @default(uuid()) @db.Uuid
+  externalId  String?   @unique @map("external_id")
+  claimCaseId String    @db.Uuid @map("claim_case_id")
+  name        String
+  position    Int
+  completedAt DateTime? @map("completed_at")
+  deadline    DateTime?
+  createdAt   DateTime  @default(now()) @map("created_at")
+  updatedAt   DateTime  @updatedAt @map("updated_at")
+
+  claimCase ClaimCase @relation(fields: [claimCaseId], references: [id])
+  tasks     Task[]
+
+  @@index([claimCaseId])
+  @@map("workflow_step")
+}
+
+model Task {
+  id             String          @id @default(uuid()) @db.Uuid
+  externalId     String?         @unique @map("external_id")
+  workflowStepId String          @db.Uuid @map("workflow_step_id")
+  title          String
+  description    String?
+  status         TaskStatus      @default(pending)
+  dueDate        DateTime?       @map("due_date")
+  result         Json?
+  submittedAt    DateTime?       @map("submitted_at")
+  submittedBy    String?         @map("submitted_by")
+  submittedByType SubmittedByType? @map("submitted_by_type")
+  createdAt      DateTime        @default(now()) @map("created_at")
+  updatedAt      DateTime        @updatedAt @map("updated_at")
+
+  // Case is derived via workflowStep.claimCaseId only — no redundant direct
+  // FK here (the previous schema had both, which invites drift).
+  workflowStep WorkflowStep @relation(fields: [workflowStepId], references: [id])
+
+  @@index([workflowStepId])
+  @@index([status, dueDate])
+  @@map("task")
+}
+
+// Case-level invite (per your BRD ERD): links a specific customer to a
+// specific case. Distinct from Organisation.inviteCode, which is the static
+// per-org code used at agent sign-up.
+model Invite {
+  id          String       @id @default(uuid()) @db.Uuid
+  externalId  String?      @unique @map("external_id")
+  claimCaseId String       @db.Uuid @map("claim_case_id")
+  customerId  String       @db.Uuid @map("customer_id")
+  code        String       @unique
+  status      InviteStatus @default(pending)
+  redeemedAt  DateTime?    @map("redeemed_at")
+  createdAt   DateTime     @default(now()) @map("created_at")
+  updatedAt   DateTime     @updatedAt @map("updated_at")
+
+  claimCase ClaimCase @relation(fields: [claimCaseId], references: [id])
+  customer  Customer  @relation(fields: [customerId], references: [id])
+
+  @@index([claimCaseId])
+  @@index([customerId])
+  @@map("invite")
+}
+
+// ---------------------------------------------------------------------------
+// Cross-cutting: audit, import/export run logs, notification dedupe
+// ---------------------------------------------------------------------------
+
+model AuditEvent {
+  id            String    @id @default(uuid()) @db.Uuid
+  actorType     ActorType @map("actor_type")
+  actorId       String    @map("actor_id")
+  action        String
+  entityType    String    @map("entity_type")
+  entityId      String    @map("entity_id")
+  correlationId String?   @map("correlation_id")
+  metadata      Json?
+  createdAt     DateTime  @default(now()) @map("created_at")
+
+  @@index([entityType, entityId])
+  @@index([createdAt])
+  @@map("audit_event")
+}
+
+model DataExchangeRun {
+  id          String            @id @default(uuid()) @db.Uuid
+  direction   ExchangeDirection
+  status      ExchangeStatus    @default(running)
+  s3Prefix    String?           @map("s3_prefix")
+  startedAt   DateTime          @default(now()) @map("started_at")
+  completedAt DateTime?         @map("completed_at")
+
+  results DataExchangeTableResult[]
+
+  @@map("data_exchange_run")
+}
+
+model DataExchangeTableResult {
+  id            String  @id @default(uuid()) @db.Uuid
+  runId         String  @db.Uuid @map("run_id")
+  tableName     String  @map("table_name")
+  rowsProcessed Int     @default(0) @map("rows_processed")
+  rowsInserted  Int     @default(0) @map("rows_inserted")
+  rowsUpdated   Int     @default(0) @map("rows_updated")
+  rowsSkipped   Int     @default(0) @map("rows_skipped")
+  rowsErrored   Int     @default(0) @map("rows_errored")
+  errorDetails  Json?   @map("error_details")
+
+  run DataExchangeRun @relation(fields: [runId], references: [id])
+
+  @@index([runId])
+  @@map("data_exchange_table_result")
+}
+
+// One row per case CURRENTLY in an action_required period (FR-14 dedupe).
+// Deleted when the case leaves action_required, so a later relapse notifies
+// again — same pattern as the reference POC.
+model CaseNotification {
+  claimCaseId          String   @id @map("claim_case_id") @db.Uuid
+  lastActionRequiredAt DateTime @map("last_action_required_at")
+  lastNotifiedAt       DateTime @map("last_notified_at")
+
+  claimCase ClaimCase @relation(fields: [claimCaseId], references: [id])
+
+  @@map("case_notification")
+}

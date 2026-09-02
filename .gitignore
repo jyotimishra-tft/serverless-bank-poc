@@ -1,0 +1,12 @@
+node_modules/
+dist/
+.env
+.env.*
+coverage/
+.prisma/
+***.log
+brd-customer-case-progress-summary.md
+creds.md
+implementation-steps.md
+build-prisma-layer.ps1
+.aws-sam/

@@ -1,0 +1,13 @@
+version = 0.1
+
+[default.deploy.parameters]
+stack_name = "poc-foundation"
+resolve_s3 = true
+s3_prefix = "poc-foundation"
+confirm_changeset = true
+capabilities = "CAPABILITY_IAM"
+disable_rollback = true
+parameter_overrides = "DbName=\"pocdb\" DbMasterUsername=\"postgres\" VpcId=\"vpc-0dab22da294d2d7b3\" SubnetIds=\"subnet-09bd042d374d8d11b,subnet-0da4bfb408264e822\" FromEmail=\"mishra.jyoti@tftus.com\""
+image_repositories = []
+[default.global.parameters]
+region = "ap-southeast-2"
